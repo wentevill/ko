@@ -24,8 +24,6 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
-	"syscall"
-	"time"
 
 	"github.com/google/go-containerregistry/internal/redact"
 	"github.com/google/go-containerregistry/internal/retry"
@@ -59,12 +57,12 @@ func Write(ref name.Reference, img v1.Image, options ...Option) (rerr error) {
 			return err
 		}
 		defer close(o.updates)
-		defer func() { sendError(o.updates, rerr) }()
+		defer func() { _ = sendError(o.updates, rerr) }()
 	}
-	return writeImage(ref, img, o, lastUpdate)
+	return writeImage(o.context, ref, img, o, lastUpdate)
 }
 
-func writeImage(ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Update) error {
+func writeImage(ctx context.Context, ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Update) error {
 	ls, err := img.Layers()
 	if err != nil {
 		return err
@@ -77,19 +75,21 @@ func writeImage(ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Upd
 	w := writer{
 		repo:       ref.Context(),
 		client:     &http.Client{Transport: tr},
-		context:    o.context,
+		context:    ctx,
 		updates:    o.updates,
 		lastUpdate: lastUpdate,
+		backoff:    o.retryBackoff,
+		predicate:  o.retryPredicate,
 	}
 
 	// Upload individual blobs and collect any errors.
 	blobChan := make(chan v1.Layer, 2*o.jobs)
-	g, ctx := errgroup.WithContext(o.context)
+	g, gctx := errgroup.WithContext(ctx)
 	for i := 0; i < o.jobs; i++ {
 		// Start N workers consuming blobs to upload.
 		g.Go(func() error {
 			for b := range blobChan {
-				if err := w.uploadOne(b); err != nil {
+				if err := w.uploadOne(gctx, b); err != nil {
 					return err
 				}
 			}
@@ -128,15 +128,12 @@ func writeImage(ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Upd
 			}
 			select {
 			case blobChan <- l:
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-gctx.Done():
+				return gctx.Err()
 			}
 		}
 		return nil
 	})
-	if err := g.Wait(); err != nil {
-		return err
-	}
 
 	if l, err := partial.ConfigLayer(img); err != nil {
 		// We can't read the ConfigLayer, possibly because of streaming layers,
@@ -151,13 +148,13 @@ func writeImage(ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Upd
 		if err != nil {
 			return err
 		}
-		if err := w.uploadOne(l); err != nil {
+		if err := w.uploadOne(ctx, l); err != nil {
 			return err
 		}
 	} else {
 		// We *can* read the ConfigLayer, so upload it concurrently with the layers.
 		g.Go(func() error {
-			return w.uploadOne(l)
+			return w.uploadOne(gctx, l)
 		})
 
 		// Wait for the layers + config.
@@ -168,7 +165,7 @@ func writeImage(ref name.Reference, img v1.Image, o *options, lastUpdate *v1.Upd
 
 	// With all of the constituent elements uploaded, upload the manifest
 	// to commit the image.
-	return w.commitManifest(img, ref)
+	return w.commitManifest(ctx, img, ref)
 }
 
 // writer writes the elements of an image to a remote image reference.
@@ -179,6 +176,8 @@ type writer struct {
 
 	updates    chan<- v1.Update
 	lastUpdate *v1.Update
+	backoff    Backoff
+	predicate  retry.Predicate
 }
 
 func sendError(ch chan<- v1.Update, err error) error {
@@ -268,13 +267,16 @@ func (w *writer) checkExistingManifest(h v1.Hash, mt types.MediaType) (bool, err
 // On success, the layer was either mounted (nothing more to do) or a blob
 // upload was initiated and the body of that blob should be sent to the returned
 // location.
-func (w *writer) initiateUpload(from, mount string) (location string, mounted bool, err error) {
+func (w *writer) initiateUpload(from, mount, origin string) (location string, mounted bool, err error) {
 	u := w.url(fmt.Sprintf("/v2/%s/blobs/uploads/", w.repo.RepositoryStr()))
 	uv := url.Values{}
 	if mount != "" && from != "" {
 		// Quay will fail if we specify a "mount" without a "from".
-		uv["mount"] = []string{mount}
-		uv["from"] = []string{from}
+		uv.Set("mount", mount)
+		uv.Set("from", from)
+		if origin != "" {
+			uv.Set("origin", origin)
+		}
 	}
 	u.RawQuery = uv.Encode()
 
@@ -335,16 +337,29 @@ func (r *progressReader) Close() error { return r.rc.Close() }
 // streamBlob streams the contents of the blob to the specified location.
 // On failure, this will return an error.  On success, this will return the location
 // header indicating how to commit the streamed blob.
-func (w *writer) streamBlob(ctx context.Context, blob io.ReadCloser, streamLocation string) (commitLocation string, rerr error) {
+func (w *writer) streamBlob(ctx context.Context, layer v1.Layer, streamLocation string) (commitLocation string, rerr error) {
 	reset := func() {}
 	defer func() {
 		if rerr != nil {
 			reset()
 		}
 	}()
+	blob, err := layer.Compressed()
+	if err != nil {
+		return "", err
+	}
+
+	getBody := layer.Compressed
 	if w.updates != nil {
 		var count int64
 		blob = &progressReader{rc: blob, updates: w.updates, lastUpdate: w.lastUpdate, count: &count}
+		getBody = func() (io.ReadCloser, error) {
+			blob, err := layer.Compressed()
+			if err != nil {
+				return nil, err
+			}
+			return &progressReader{rc: blob, updates: w.updates, lastUpdate: w.lastUpdate, count: &count}, nil
+		}
 		reset = func() {
 			atomic.AddInt64(&w.lastUpdate.Complete, -count)
 			w.updates <- *w.lastUpdate
@@ -354,6 +369,10 @@ func (w *writer) streamBlob(ctx context.Context, blob io.ReadCloser, streamLocat
 	req, err := http.NewRequest(http.MethodPatch, streamLocation, blob)
 	if err != nil {
 		return "", err
+	}
+	if _, ok := layer.(*stream.Layer); !ok {
+		// We can't retry streaming layers.
+		req.GetBody = getBody
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -405,60 +424,39 @@ func (w *writer) incrProgress(written int64) {
 	}
 	w.updates <- v1.Update{
 		Total:    w.lastUpdate.Total,
-		Complete: atomic.AddInt64(&w.lastUpdate.Complete, int64(written)),
+		Complete: atomic.AddInt64(&w.lastUpdate.Complete, written),
 	}
-}
-
-var shouldRetry retry.Predicate = func(err error) bool {
-	// Various failure modes here, as we're often reading from and writing to
-	// the network.
-	if retry.IsTemporary(err) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.EPIPE) {
-		logs.Warn.Printf("retrying %v", err)
-		return true
-	}
-	return false
-}
-
-// Try this three times, waiting 1s after first failure, 3s after second.
-var backoff = retry.Backoff{
-	Duration: 1.0 * time.Second,
-	Factor:   3.0,
-	Jitter:   0.1,
-	Steps:    3,
 }
 
 // uploadOne performs a complete upload of a single layer.
-func (w *writer) uploadOne(l v1.Layer) error {
-	var from, mount string
-	if h, err := l.Digest(); err == nil {
-		// If we know the digest, this isn't a streaming layer. Do an existence
-		// check so we can skip uploading the layer if possible.
-		existing, err := w.checkExistingBlob(h)
-		if err != nil {
-			return err
-		}
-		if existing {
-			size, err := l.Size()
+func (w *writer) uploadOne(ctx context.Context, l v1.Layer) error {
+	tryUpload := func() error {
+		var from, mount, origin string
+		if h, err := l.Digest(); err == nil {
+			// If we know the digest, this isn't a streaming layer. Do an existence
+			// check so we can skip uploading the layer if possible.
+			existing, err := w.checkExistingBlob(h)
 			if err != nil {
 				return err
 			}
-			w.incrProgress(size)
-			logs.Progress.Printf("existing blob: %v", h)
-			return nil
-		}
+			if existing {
+				size, err := l.Size()
+				if err != nil {
+					return err
+				}
+				w.incrProgress(size)
+				logs.Progress.Printf("existing blob: %v", h)
+				return nil
+			}
 
-		mount = h.String()
-	}
-	if ml, ok := l.(*MountableLayer); ok {
-		if w.repo.RegistryStr() == ml.Reference.Context().RegistryStr() {
+			mount = h.String()
+		}
+		if ml, ok := l.(*MountableLayer); ok {
 			from = ml.Reference.Context().RepositoryStr()
+			origin = ml.Reference.Context().RegistryStr()
 		}
-	}
 
-	ctx := w.context
-
-	tryUpload := func() error {
-		location, mounted, err := w.initiateUpload(from, mount)
+		location, mounted, err := w.initiateUpload(from, mount, origin)
 		if err != nil {
 			return err
 		} else if mounted {
@@ -486,11 +484,7 @@ func (w *writer) uploadOne(l v1.Layer) error {
 			ctx = redact.NewContext(ctx, "omitting binary blobs from logs")
 		}
 
-		blob, err := l.Compressed()
-		if err != nil {
-			return err
-		}
-		location, err = w.streamBlob(ctx, blob, location)
+		location, err = w.streamBlob(ctx, l, location)
 		if err != nil {
 			return err
 		}
@@ -508,14 +502,14 @@ func (w *writer) uploadOne(l v1.Layer) error {
 		return nil
 	}
 
-	return retry.Retry(tryUpload, shouldRetry, backoff)
+	return retry.Retry(tryUpload, w.predicate, w.backoff)
 }
 
 type withLayer interface {
 	Layer(v1.Hash) (v1.Layer, error)
 }
 
-func (w *writer) writeIndex(ref name.Reference, ii v1.ImageIndex, options ...Option) error {
+func (w *writer) writeIndex(ctx context.Context, ref name.Reference, ii v1.ImageIndex, options ...Option) error {
 	index, err := ii.IndexManifest()
 	if err != nil {
 		return err
@@ -544,7 +538,7 @@ func (w *writer) writeIndex(ref name.Reference, ii v1.ImageIndex, options ...Opt
 			if err != nil {
 				return err
 			}
-			if err := w.writeIndex(ref, ii); err != nil {
+			if err := w.writeIndex(ctx, ref, ii, options...); err != nil {
 				return err
 			}
 		case types.OCIManifestSchema1, types.DockerManifestSchema2:
@@ -552,7 +546,7 @@ func (w *writer) writeIndex(ref name.Reference, ii v1.ImageIndex, options ...Opt
 			if err != nil {
 				return err
 			}
-			if err := writeImage(ref, img, o, w.lastUpdate); err != nil {
+			if err := writeImage(ctx, ref, img, o, w.lastUpdate); err != nil {
 				return err
 			}
 		default:
@@ -562,7 +556,7 @@ func (w *writer) writeIndex(ref name.Reference, ii v1.ImageIndex, options ...Opt
 				if err != nil {
 					return err
 				}
-				if err := w.uploadOne(layer); err != nil {
+				if err := w.uploadOne(ctx, layer); err != nil {
 					return err
 				}
 			}
@@ -571,7 +565,7 @@ func (w *writer) writeIndex(ref name.Reference, ii v1.ImageIndex, options ...Opt
 
 	// With all of the constituent elements uploaded, upload the manifest
 	// to commit the image.
-	return w.commitManifest(ii, ref)
+	return w.commitManifest(ctx, ii, ref)
 }
 
 type withMediaType interface {
@@ -617,7 +611,7 @@ func unpackTaggable(t Taggable) ([]byte, *v1.Descriptor, error) {
 }
 
 // commitManifest does a PUT of the image's manifest.
-func (w *writer) commitManifest(t Taggable, ref name.Reference) error {
+func (w *writer) commitManifest(ctx context.Context, t Taggable, ref name.Reference) error {
 	tryUpload := func() error {
 		raw, desc, err := unpackTaggable(t)
 		if err != nil {
@@ -633,7 +627,7 @@ func (w *writer) commitManifest(t Taggable, ref name.Reference) error {
 		}
 		req.Header.Set("Content-Type", string(desc.MediaType))
 
-		resp, err := w.client.Do(req.WithContext(w.context))
+		resp, err := w.client.Do(req.WithContext(ctx))
 		if err != nil {
 			return err
 		}
@@ -649,7 +643,7 @@ func (w *writer) commitManifest(t Taggable, ref name.Reference) error {
 		return nil
 	}
 
-	return retry.Retry(tryUpload, shouldRetry, backoff)
+	return retry.Retry(tryUpload, w.predicate, w.backoff)
 }
 
 func scopesForUploadingImage(repo name.Repository, layers []v1.Layer) []string {
@@ -692,10 +686,12 @@ func WriteIndex(ref name.Reference, ii v1.ImageIndex, options ...Option) (rerr e
 		return err
 	}
 	w := writer{
-		repo:    ref.Context(),
-		client:  &http.Client{Transport: tr},
-		context: o.context,
-		updates: o.updates,
+		repo:      ref.Context(),
+		client:    &http.Client{Transport: tr},
+		context:   o.context,
+		updates:   o.updates,
+		backoff:   o.retryBackoff,
+		predicate: o.retryPredicate,
 	}
 
 	if o.updates != nil {
@@ -708,7 +704,7 @@ func WriteIndex(ref name.Reference, ii v1.ImageIndex, options ...Option) (rerr e
 		defer func() { sendError(o.updates, rerr) }()
 	}
 
-	return w.writeIndex(ref, ii, options...)
+	return w.writeIndex(o.context, ref, ii, options...)
 }
 
 // countImage counts the total size of all layers + config blob + manifest for
@@ -831,10 +827,12 @@ func WriteLayer(repo name.Repository, layer v1.Layer, options ...Option) (rerr e
 		return err
 	}
 	w := writer{
-		repo:    repo,
-		client:  &http.Client{Transport: tr},
-		context: o.context,
-		updates: o.updates,
+		repo:      repo,
+		client:    &http.Client{Transport: tr},
+		context:   o.context,
+		updates:   o.updates,
+		backoff:   o.retryBackoff,
+		predicate: o.retryPredicate,
 	}
 
 	if o.updates != nil {
@@ -851,7 +849,7 @@ func WriteLayer(repo name.Repository, layer v1.Layer, options ...Option) (rerr e
 		}
 		w.lastUpdate = &v1.Update{Total: size}
 	}
-	return w.uploadOne(layer)
+	return w.uploadOne(o.context, layer)
 }
 
 // Tag adds a tag to the given Taggable via PUT /v2/.../manifests/<tag>
@@ -898,10 +896,12 @@ func Put(ref name.Reference, t Taggable, options ...Option) error {
 		return err
 	}
 	w := writer{
-		repo:    ref.Context(),
-		client:  &http.Client{Transport: tr},
-		context: o.context,
+		repo:      ref.Context(),
+		client:    &http.Client{Transport: tr},
+		context:   o.context,
+		backoff:   o.retryBackoff,
+		predicate: o.retryPredicate,
 	}
 
-	return w.commitManifest(t, ref)
+	return w.commitManifest(o.context, t, ref)
 }
