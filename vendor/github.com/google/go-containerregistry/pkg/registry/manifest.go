@@ -89,7 +89,8 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 	target := elem[len(elem)-1]
 	repo := strings.Join(elem[1:len(elem)-2], "/")
 
-	if req.Method == "GET" {
+	switch req.Method {
+	case http.MethodGet:
 		m.lock.Lock()
 		defer m.lock.Unlock()
 
@@ -117,9 +118,8 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		resp.WriteHeader(http.StatusOK)
 		io.Copy(resp, bytes.NewReader(m.blob))
 		return nil
-	}
 
-	if req.Method == "HEAD" {
+	case http.MethodHead:
 		m.lock.Lock()
 		defer m.lock.Unlock()
 		if _, ok := m.manifests[repo]; !ok {
@@ -144,9 +144,8 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
 		resp.WriteHeader(http.StatusOK)
 		return nil
-	}
 
-	if req.Method == "PUT" {
+	case http.MethodPut:
 		m.lock.Lock()
 		defer m.lock.Unlock()
 		if _, ok := m.manifests[repo]; !ok {
@@ -200,9 +199,8 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
 		return nil
-	}
 
-	if req.Method == "DELETE" {
+	case http.MethodDelete:
 		m.lock.Lock()
 		defer m.lock.Unlock()
 		if _, ok := m.manifests[repo]; !ok {
@@ -225,12 +223,13 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		delete(m.manifests[repo], target)
 		resp.WriteHeader(http.StatusAccepted)
 		return nil
-	}
 
-	return &regError{
-		Status:  http.StatusBadRequest,
-		Code:    "METHOD_UNKNOWN",
-		Message: "We don't understand your method + url",
+	default:
+		return &regError{
+			Status:  http.StatusBadRequest,
+			Code:    "METHOD_UNKNOWN",
+			Message: "We don't understand your method + url",
+		}
 	}
 }
 
@@ -238,12 +237,6 @@ func (m *manifests) handleTags(resp http.ResponseWriter, req *http.Request) *reg
 	elem := strings.Split(req.URL.Path, "/")
 	elem = elem[1:]
 	repo := strings.Join(elem[1:len(elem)-2], "/")
-	query := req.URL.Query()
-	nStr := query.Get("n")
-	n := 1000
-	if nStr != "" {
-		n, _ = strconv.Atoi(nStr)
-	}
 
 	if req.Method == "GET" {
 		m.lock.Lock()
@@ -259,18 +252,36 @@ func (m *manifests) handleTags(resp http.ResponseWriter, req *http.Request) *reg
 		}
 
 		var tags []string
-		countTags := 0
-		// TODO: implement pagination https://github.com/opencontainers/distribution-spec/blob/b505e9cc53ec499edbd9c1be32298388921bb705/detail.md#tags-paginated
 		for tag := range c {
-			if countTags >= n {
-				break
-			}
-			countTags++
 			if !strings.Contains(tag, "sha256:") {
 				tags = append(tags, tag)
 			}
 		}
 		sort.Strings(tags)
+
+		// https://github.com/opencontainers/distribution-spec/blob/b505e9cc53ec499edbd9c1be32298388921bb705/detail.md#tags-paginated
+		// Offset using last query parameter.
+		if last := req.URL.Query().Get("last"); last != "" {
+			for i, t := range tags {
+				if t > last {
+					tags = tags[i:]
+					break
+				}
+			}
+		}
+
+		// Limit using n query parameter.
+		if ns := req.URL.Query().Get("n"); ns != "" {
+			if n, err := strconv.Atoi(ns); err != nil {
+				return &regError{
+					Status:  http.StatusBadRequest,
+					Code:    "BAD_REQUEST",
+					Message: fmt.Sprintf("parsing n: %v", err),
+				}
+			} else if n < len(tags) {
+				tags = tags[:n]
+			}
+		}
 
 		tagsToList := listTags{
 			Name: repo,
