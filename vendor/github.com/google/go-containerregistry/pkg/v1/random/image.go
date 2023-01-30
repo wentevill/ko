@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	mrand "math/rand"
 	"time"
 
@@ -47,7 +46,7 @@ func (ul *uncompressedLayer) DiffID() (v1.Hash, error) {
 
 // Uncompressed implements partial.UncompressedLayer
 func (ul *uncompressedLayer) Uncompressed() (io.ReadCloser, error) {
-	return ioutil.NopCloser(bytes.NewBuffer(ul.content)), nil
+	return io.NopCloser(bytes.NewBuffer(ul.content)), nil
 }
 
 // MediaType returns the media type of the layer
@@ -81,7 +80,7 @@ func Image(byteSize, layers int64) (v1.Image, error) {
 
 // Layer returns a layer with pseudo-randomly generated content.
 func Layer(byteSize int64, mt types.MediaType) (v1.Layer, error) {
-	fileName := fmt.Sprintf("random_file_%d.txt", mrand.Int())
+	fileName := fmt.Sprintf("random_file_%d.txt", mrand.Int()) //nolint: gosec
 
 	// Hash the contents as we write it out to the buffer.
 	var b bytes.Buffer

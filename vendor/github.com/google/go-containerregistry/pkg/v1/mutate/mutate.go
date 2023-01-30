@@ -18,9 +18,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"path/filepath"
 	"strings"
 	"time"
@@ -125,15 +125,15 @@ type Annotatable interface {
 // The annotatable input is expected to be a v1.Image or v1.ImageIndex, and
 // returns the same type. You can type-assert the result like so:
 //
-//     img := Annotations(empty.Image, map[string]string{
-//         "foo": "bar",
-//     }).(v1.Image)
+//	img := Annotations(empty.Image, map[string]string{
+//	    "foo": "bar",
+//	}).(v1.Image)
 //
 // Or for an index:
 //
-//     idx := Annotations(empty.Index, map[string]string{
-//         "foo": "bar",
-//     }).(v1.ImageIndex)
+//	idx := Annotations(empty.Index, map[string]string{
+//	    "foo": "bar",
+//	}).(v1.ImageIndex)
 //
 // If the input Annotatable is not an Image or ImageIndex, the result will
 // attempt to lazily annotate the raw manifest.
@@ -163,7 +163,7 @@ func (a arbitraryRawManifest) RawManifest() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err
 	}
@@ -241,8 +241,9 @@ func extract(img v1.Image, w io.Writer) error {
 
 	layers, err := img.Layers()
 	if err != nil {
-		return fmt.Errorf("retrieving image layers: %v", err)
+		return fmt.Errorf("retrieving image layers: %w", err)
 	}
+
 	// we iterate through the layers in reverse order because it makes handling
 	// whiteout layers more efficient, since we can just keep track of the removed
 	// files as we see .wh. layers and ignore those in previous layers.
@@ -250,18 +251,26 @@ func extract(img v1.Image, w io.Writer) error {
 		layer := layers[i]
 		layerReader, err := layer.Uncompressed()
 		if err != nil {
-			return fmt.Errorf("reading layer contents: %v", err)
+			return fmt.Errorf("reading layer contents: %w", err)
 		}
 		defer layerReader.Close()
 		tarReader := tar.NewReader(layerReader)
 		for {
 			header, err := tarReader.Next()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
-				return fmt.Errorf("reading tar: %v", err)
+				return fmt.Errorf("reading tar: %w", err)
 			}
+
+			// Some tools prepend everything with "./", so if we don't Clean the
+			// name, we may have duplicate entries, which angers tar-split.
+			header.Name = filepath.Clean(header.Name)
+			// force PAX format to remove Name/Linkname length limit of 100 characters
+			// required by USTAR and to not depend on internal tar package guess which
+			// prefers USTAR over PAX
+			header.Format = tar.FormatPAX
 
 			basename := filepath.Base(header.Name)
 			dirname := filepath.Dir(header.Name)
@@ -292,9 +301,11 @@ func extract(img v1.Image, w io.Writer) error {
 			// any entries with a matching (or child) name
 			fileMap[name] = tombstone || !(header.Typeflag == tar.TypeDir)
 			if !tombstone {
-				tarWriter.WriteHeader(header)
+				if err := tarWriter.WriteHeader(header); err != nil {
+					return err
+				}
 				if header.Size > 0 {
-					if _, err := io.Copy(tarWriter, tarReader); err != nil {
+					if _, err := io.CopyN(tarWriter, tarReader, header.Size); err != nil {
 						return err
 					}
 				}
@@ -321,38 +332,64 @@ func inWhiteoutDir(fileMap map[string]bool, file string) bool {
 	return false
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // Time sets all timestamps in an image to the given timestamp.
 func Time(img v1.Image, t time.Time) (v1.Image, error) {
 	newImage := empty.Image
 
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("getting image layers: %v", err)
-	}
-
-	// Strip away all timestamps from layers
-	var newLayers []v1.Layer
-	for _, layer := range layers {
-		newLayer, err := layerTime(layer, t)
-		if err != nil {
-			return nil, fmt.Errorf("setting layer times: %v", err)
-		}
-		newLayers = append(newLayers, newLayer)
-	}
-
-	newImage, err = AppendLayers(newImage, newLayers...)
-	if err != nil {
-		return nil, fmt.Errorf("appending layers: %v", err)
+		return nil, fmt.Errorf("getting image layers: %w", err)
 	}
 
 	ocf, err := img.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("getting original config file: %v", err)
+		return nil, fmt.Errorf("getting original config file: %w", err)
+	}
+
+	addendums := make([]Addendum, max(len(ocf.History), len(layers)))
+	var historyIdx, addendumIdx int
+	for layerIdx := 0; layerIdx < len(layers); addendumIdx, layerIdx = addendumIdx+1, layerIdx+1 {
+		newLayer, err := layerTime(layers[layerIdx], t)
+		if err != nil {
+			return nil, fmt.Errorf("setting layer times: %w", err)
+		}
+
+		// try to search for the history entry that corresponds to this layer
+		for ; historyIdx < len(ocf.History); historyIdx++ {
+			addendums[addendumIdx].History = ocf.History[historyIdx]
+			// if it's an EmptyLayer, do not set the Layer and have the Addendum with just the History
+			// and move on to the next History entry
+			if ocf.History[historyIdx].EmptyLayer {
+				addendumIdx++
+				continue
+			}
+			// otherwise, we can exit from the cycle
+			historyIdx++
+			break
+		}
+		addendums[addendumIdx].Layer = newLayer
+	}
+
+	// add all leftover History entries
+	for ; historyIdx < len(ocf.History); historyIdx, addendumIdx = historyIdx+1, addendumIdx+1 {
+		addendums[addendumIdx].History = ocf.History[historyIdx]
+	}
+
+	newImage, err = Append(newImage, addendums...)
+	if err != nil {
+		return nil, fmt.Errorf("appending layers: %w", err)
 	}
 
 	cf, err := newImage.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("setting config file: %v", err)
+		return nil, fmt.Errorf("setting config file: %w", err)
 	}
 
 	cfg := cf.DeepCopy()
@@ -366,8 +403,14 @@ func Time(img v1.Image, t time.Time) (v1.Image, error) {
 	// Strip away timestamps from the config file
 	cfg.Created = v1.Time{Time: t}
 
-	for _, h := range cfg.History {
+	for i, h := range cfg.History {
 		h.Created = v1.Time{Time: t}
+		h.CreatedBy = ocf.History[i].CreatedBy
+		h.Comment = ocf.History[i].Comment
+		h.EmptyLayer = ocf.History[i].EmptyLayer
+		// Explicitly ignore Author field; which hinders reproducibility
+		h.Author = ""
+		cfg.History[i] = h
 	}
 
 	return ConfigFile(newImage, cfg)
@@ -376,7 +419,7 @@ func Time(img v1.Image, t time.Time) (v1.Image, error) {
 func layerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	layerReader, err := layer.Uncompressed()
 	if err != nil {
-		return nil, fmt.Errorf("getting layer: %v", err)
+		return nil, fmt.Errorf("getting layer: %w", err)
 	}
 	defer layerReader.Close()
 	w := new(bytes.Buffer)
@@ -386,21 +429,22 @@ func layerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	tarReader := tar.NewReader(layerReader)
 	for {
 		header, err := tarReader.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("reading layer: %v", err)
+			return nil, fmt.Errorf("reading layer: %w", err)
 		}
 
 		header.ModTime = t
 		if err := tarWriter.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("writing tar header: %v", err)
+			return nil, fmt.Errorf("writing tar header: %w", err)
 		}
 
 		if header.Typeflag == tar.TypeReg {
-			if _, err = io.Copy(tarWriter, tarReader); err != nil {
-				return nil, fmt.Errorf("writing layer file: %v", err)
+			// TODO(#1168): This should be lazy, and not buffer the entire layer contents.
+			if _, err = io.CopyN(tarWriter, tarReader, header.Size); err != nil {
+				return nil, fmt.Errorf("writing layer file: %w", err)
 			}
 		}
 	}
@@ -412,11 +456,11 @@ func layerTime(layer v1.Layer, t time.Time) (v1.Layer, error) {
 	b := w.Bytes()
 	// gzip the contents, then create the layer
 	opener := func() (io.ReadCloser, error) {
-		return gzip.ReadCloser(ioutil.NopCloser(bytes.NewReader(b))), nil
+		return gzip.ReadCloser(io.NopCloser(bytes.NewReader(b))), nil
 	}
 	layer, err = tarball.LayerFromOpener(opener)
 	if err != nil {
-		return nil, fmt.Errorf("creating layer: %v", err)
+		return nil, fmt.Errorf("creating layer: %w", err)
 	}
 
 	return layer, nil
@@ -452,6 +496,14 @@ func MediaType(img v1.Image, mt types.MediaType) v1.Image {
 	return &image{
 		base:      img,
 		mediaType: &mt,
+	}
+}
+
+// ConfigMediaType modifies the MediaType() of the given image's Config.
+func ConfigMediaType(img v1.Image, mt types.MediaType) v1.Image {
+	return &image{
+		base:            img,
+		configMediaType: &mt,
 	}
 }
 

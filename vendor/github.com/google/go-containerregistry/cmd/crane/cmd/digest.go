@@ -19,32 +19,48 @@ import (
 	"fmt"
 
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/spf13/cobra"
 )
 
 // NewCmdDigest creates a new cobra.Command for the digest subcommand.
 func NewCmdDigest(options *[]crane.Option) *cobra.Command {
 	var tarball string
+	var fullRef bool
 	cmd := &cobra.Command{
 		Use:   "digest IMAGE",
 		Short: "Get the digest of an image",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if tarball == "" && len(args) == 0 {
-				cmd.Help()
+				if err := cmd.Help(); err != nil {
+					return err
+				}
 				return errors.New("image reference required without --tarball")
+			}
+			if fullRef && tarball != "" {
+				return errors.New("cannot specify --full-ref with --tarball")
 			}
 
 			digest, err := getDigest(tarball, args, options)
 			if err != nil {
 				return err
 			}
-			fmt.Println(digest)
+			if fullRef {
+				ref, err := name.ParseReference(args[0])
+				if err != nil {
+					return err
+				}
+				fmt.Println(ref.Context().Digest(digest))
+			} else {
+				fmt.Println(digest)
+			}
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&tarball, "tarball", "", "(Optional) path to tarball containing the image")
+	cmd.Flags().BoolVar(&fullRef, "full-ref", false, "(Optional) if true, print the full image reference by digest")
 
 	return cmd
 }
@@ -65,11 +81,11 @@ func getTarballDigest(tarball string, args []string, options *[]crane.Option) (s
 
 	img, err := crane.LoadTag(tarball, tag, *options...)
 	if err != nil {
-		return "", fmt.Errorf("loading image from %q: %v", tarball, err)
+		return "", fmt.Errorf("loading image from %q: %w", tarball, err)
 	}
 	digest, err := img.Digest()
 	if err != nil {
-		return "", fmt.Errorf("computing digest: %v", err)
+		return "", fmt.Errorf("computing digest: %w", err)
 	}
 	return digest.String(), nil
 }
