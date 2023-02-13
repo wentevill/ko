@@ -3,10 +3,9 @@ module github.com/google/ko
 go 1.16
 
 require (
-	github.com/containerd/containerd v1.5.7 // indirect
 	github.com/containerd/stargz-snapshotter/estargz v0.9.0
 	github.com/cpuguy83/go-md2man/v2 v2.0.1 // indirect
-	github.com/docker/docker v20.10.9+incompatible
+	github.com/docker/docker v23.0.1+incompatible
 	github.com/dprotaso/go-yit v0.0.0-20191028211022-135eb7262960
 	github.com/evanphx/json-patch/v5 v5.5.0 // indirect
 	github.com/fsnotify/fsnotify v1.5.1
@@ -25,8 +24,6 @@ require (
 	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac // indirect
 	golang.org/x/tools v0.1.7
-	google.golang.org/genproto v0.0.0-20211005153810-c76a74d43a8e // indirect
-	google.golang.org/grpc v1.41.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20200902074654-038fdea0a05b // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
 	k8s.io/apimachinery v0.22.2
