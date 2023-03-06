@@ -4,7 +4,7 @@ go 1.16
 
 require (
 	github.com/containerd/containerd v1.5.7 // indirect
-	github.com/containerd/stargz-snapshotter/estargz v0.9.0
+	github.com/containerd/stargz-snapshotter/estargz v0.14.2
 	github.com/cpuguy83/go-md2man/v2 v2.0.1 // indirect
 	github.com/docker/docker v20.10.9+incompatible
 	github.com/dprotaso/go-yit v0.0.0-20191028211022-135eb7262960
@@ -20,7 +20,7 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/spf13/viper v1.9.0
 	golang.org/x/net v0.0.0-20211007125505-59d4e928ea9d // indirect
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	golang.org/x/sync v0.1.0
 	golang.org/x/sys v0.0.0-20211007075335-d3039528d8ac // indirect
 	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac // indirect
